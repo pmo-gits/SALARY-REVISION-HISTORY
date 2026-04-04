@@ -1,0 +1,215 @@
+function revisionApproval() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const SRC_SHEET_NAME = 'REVISION_APPROVAL';
+  const DST_SHEET_NAME = 'REVISION_HISTORY';
+
+  // Must run from REVISION_APPROVAL tab only
+  const active = ss.getActiveSheet();
+  if (!active || active.getName() !== SRC_SHEET_NAME) {
+    ss.toast(`Skipped: open "${SRC_SHEET_NAME}" tab and run again.`, 'Revision Approval', 6);
+    return;
+  }
+
+  const src = ss.getSheetByName(SRC_SHEET_NAME);
+  const dst = ss.getSheetByName(DST_SHEET_NAME);
+  if (!src || !dst) throw new Error('Missing required sheet(s). Check exact tab names.');
+
+  const srcLastRow = src.getLastRow();
+  const srcLastCol = src.getLastColumn();
+  if (srcLastRow < 2) return;
+
+  const dstLastCol = dst.getLastColumn();
+
+  const norm = (h) => String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  const isApproved = (v) => String(v || '').trim().toUpperCase() === 'APPROVED';
+
+  // Normalize ID to avoid hidden character issues
+  const normId = (v) =>
+    String(v || '')
+      .trim()
+      .replace(/\s+/g, '')
+      .replace(/[‐-‒–—−]/g, '-')
+      .toUpperCase();
+
+  // Headers
+  const srcHeaders = src.getRange(1, 1, 1, srcLastCol).getDisplayValues()[0];
+  const dstHeaders = dst.getRange(1, 1, 1, dstLastCol).getDisplayValues()[0];
+
+  const srcIdx = new Map(srcHeaders.map((h, i) => [norm(h), i]));
+  const dstIdx = new Map(dstHeaders.map((h, i) => [norm(h), i]));
+
+  const KEY_ID = norm('ID.NO');
+  const KEY_STATUS = norm('APPROVAL_STATUS');
+
+  if (!srcIdx.has(KEY_ID) || !srcIdx.has(KEY_STATUS)) {
+    throw new Error('REVISION_APPROVAL must contain ID.NO and APPROVAL_STATUS.');
+  }
+  if (!dstIdx.has(KEY_ID)) {
+    throw new Error('REVISION_HISTORY must contain ID.NO.');
+  }
+
+  // Destination columns
+  const ACTIVE_COL =
+    dstIdx.get(norm('ACTIVE_FOR_PAYROLL')) ??
+    dstIdx.get(norm('ACTIVE FOR PAYROLL'));
+
+  const APPROVED_BY_COL = dstIdx.get(norm('APPROVED_BY'));
+  const APPROVED_ON_COL = dstIdx.get(norm('APPROVED_ON'));
+  // REV_ID is formula-driven (do not write)
+  // const REV_ID_COL = dstIdx.get(norm('REV_ID'));
+
+  // Read source data
+  const srcData = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
+
+  // Rows to approve
+  const approveIdxs = [];
+  srcData.forEach((r, i) => {
+    if (isApproved(r[srcIdx.get(KEY_STATUS)]) && String(r[srcIdx.get(KEY_ID)]).trim()) {
+      approveIdxs.push(i);
+    }
+  });
+
+  if (!approveIdxs.length) {
+    ss.toast('No APPROVED rows found.', 'Revision Approval', 6);
+    return;
+  }
+
+  // Exclude computed/system columns
+  const excluded = new Set([
+    norm('ACTIVE_FOR_PAYROLL'),
+    norm('ACTIVE FOR PAYROLL'),
+    norm('APPROVED_BY'),
+    norm('APPROVED_ON'),
+    norm('REV_ID'),
+  ]);
+
+  // --- Robust alias mapping (minimal) ---
+  // If header differs slightly between sheets, map it.
+  const aliasPairs = [
+    // destinationKey, sourceKey
+    [norm('CHANGE OF VALUE'), norm('CHANGE OF VALUE')],
+    [norm('CHANGE OF VALUE'), norm('CHANGE_VALUE')],
+    [norm('CHANGE OF VALUE'), norm('CHANGE')],
+  ];
+
+  // Build copy keys: normal exact matches first
+  const copyKeys = [];
+  dstIdx.forEach((_, k) => {
+    if (!excluded.has(k) && srcIdx.has(k)) copyKeys.push(k);
+  });
+
+  // Ensure CHANGE OF VALUE is copied even if header differs
+  // We'll handle this separately below by looking for dstKey and any matching srcKey alias.
+  const dstChangeKey = norm('CHANGE OF VALUE');
+  const srcChangeKeyCandidates = [
+    norm('CHANGE OF VALUE'),
+    norm('CHANGE_VALUE'),
+    norm('CHANGE'),
+  ];
+
+  const now = new Date();
+  const approver = (() => {
+    try {
+      return Session.getActiveUser().getEmail() || '';
+    } catch {
+      return '';
+    }
+  })();
+
+  const outRows = [];
+  const insertedIds = [];
+
+  approveIdxs.forEach((i) => {
+    const sRow = srcData[i];
+    const dRow = new Array(dstLastCol).fill('');
+
+    // Copy direct matches
+    copyKeys.forEach((k) => {
+      dRow[dstIdx.get(k)] = sRow[srcIdx.get(k)];
+    });
+
+    // Copy CHANGE OF VALUE via aliases if needed
+    if (dstIdx.has(dstChangeKey)) {
+      let picked = '';
+      for (const sk of srcChangeKeyCandidates) {
+        if (srcIdx.has(sk)) {
+          picked = sRow[srcIdx.get(sk)];
+          break;
+        }
+      }
+      if (picked !== '') dRow[dstIdx.get(dstChangeKey)] = picked;
+    }
+
+    // Force APPROVED
+    if (dstIdx.has(KEY_STATUS)) dRow[dstIdx.get(KEY_STATUS)] = 'APPROVED';
+
+    if (APPROVED_BY_COL !== undefined) dRow[APPROVED_BY_COL] = approver;
+    if (APPROVED_ON_COL !== undefined) dRow[APPROVED_ON_COL] = now;
+
+    // Always mark new row ACTIVE
+    if (ACTIVE_COL !== undefined) dRow[ACTIVE_COL] = 'ACTIVE';
+
+    insertedIds.push(normId(sRow[srcIdx.get(KEY_ID)]));
+    outRows.push(dRow);
+  });
+
+  // ---------- Append at true last data row based on ID.NO ----------
+  const idCol1Based = dstIdx.get(KEY_ID) + 1;
+  const startRow = Math.max(getLastNonEmptyInColumn_(dst, idCol1Based, 2) + 1, 2);
+
+  // Read previous IDs only up to pre-append area
+  const prevLastRow = startRow - 1;
+  let prevIds = [];
+  if (prevLastRow >= 2) {
+    prevIds = dst
+      .getRange(2, idCol1Based, prevLastRow - 1, 1)
+      .getDisplayValues()
+      .map((r) => normId(r[0]));
+  }
+
+  // Append rows
+  dst.getRange(startRow, 1, outRows.length, dstLastCol).setValues(outRows);
+
+  // Deactivate previous rows if found (only among pre-existing rows)
+  if (ACTIVE_COL !== undefined && prevIds.length) {
+    insertedIds.forEach((id) => {
+      for (let idx = prevIds.length - 1; idx >= 0; idx--) {
+        if (prevIds[idx] === id) {
+          const sheetRow = idx + 2; // prevIds[0] => row 2
+          dst.getRange(sheetRow, ACTIVE_COL + 1).setValue('IN-ACTIVE');
+          break;
+        }
+      }
+    });
+  }
+
+  // Delete approved rows from source (bottom-up)
+  approveIdxs
+    .map((i) => i + 2)
+    .sort((a, b) => b - a)
+    .forEach((r) => src.deleteRow(r));
+
+  ss.toast(`Approved ${outRows.length} revision(s).`, 'Revision Approval', 7);
+}
+
+/**
+ * Returns the last row index (>= startRow) where column col1Based has a non-empty display value.
+ * Ignores formatting and formulas that display "".
+ */
+function getLastNonEmptyInColumn_(sheet, col1Based, startRow) {
+  const maxRows = sheet.getMaxRows();
+  const batch = 2000;
+
+  for (let end = maxRows; end >= startRow; end -= batch) {
+    const begin = Math.max(startRow, end - batch + 1);
+    const values = sheet.getRange(begin, col1Based, end - begin + 1, 1).getDisplayValues();
+
+    for (let i = values.length - 1; i >= 0; i--) {
+      if (String(values[i][0] || '').trim() !== '') {
+        return begin + i;
+      }
+    }
+  }
+  return startRow - 1;
+}
