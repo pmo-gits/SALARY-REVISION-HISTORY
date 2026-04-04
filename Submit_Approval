@@ -1,0 +1,195 @@
+/**
+ * MAIN LOGIC: Submit for Approval + Threaded Email Notification (single ongoing thread)
+ *
+ * Update:
+ * - Clears ONLY: ID.NO, REVISION_TYPE, PLANNED GROSS, EFFECTIVE_FROM [MM/DD/YY]
+ * - Email table headers now WRAP TEXT (no nowrap)
+ */
+function submitForApproval() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const SRC_SHEET_NAME = 'HR_UPDATE';
+  const DST_SHEET_NAME = 'REVISION_APPROVAL';
+
+  // Email config
+  const EMAIL_TO = 'pmo@butlerleather.com';
+  const EMAIL_REPLY_TO = 'pmo@butlerleather.com';
+  const EMAIL_SUBJECT = 'Salary Revision Approval Request [SR-APPROVAL]';
+
+  const EMAIL_MESSAGE =
+    'Salary revision request have been submitted for the employees listed below. Kindly review and share your approval/comments.';
+
+  // Must run from HR_UPDATE tab only
+  const active = ss.getActiveSheet();
+  if (!active || active.getName() !== SRC_SHEET_NAME) {
+    ss.toast(`Skipped: open "${SRC_SHEET_NAME}" tab and run again.`, 'Submit for Approval', 6);
+    return;
+  }
+
+  const src = ss.getSheetByName(SRC_SHEET_NAME);
+  const dst = ss.getSheetByName(DST_SHEET_NAME);
+  if (!src || !dst) {
+    throw new Error(
+      'Missing required sheet(s). Check exact tab names: HR_UPDATE and REVISION_APPROVAL.'
+    );
+  }
+
+  const srcLastRow = src.getLastRow();
+  const srcLastCol = src.getLastColumn();
+  if (srcLastRow < 2) return;
+
+  const dstLastCol = dst.getLastColumn();
+
+  const norm = (h) => String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
+
+  const srcHeaders = src.getRange(1, 1, 1, srcLastCol).getDisplayValues()[0];
+  const dstHeaders = dst.getRange(1, 1, 1, dstLastCol).getDisplayValues()[0];
+
+  const srcIdx = new Map();
+  srcHeaders.forEach((h, i) => srcIdx.set(norm(h), i));
+
+  const dstIdx = new Map();
+  dstHeaders.forEach((h, i) => dstIdx.set(norm(h), i));
+
+  // These are the required fields to be eligible to submit
+  const HR_INPUT_SRC = [
+    'ID.NO',
+    'BASIC',
+    'DA',
+    'HRA',
+    'CONV.ALL',
+    'SPL.ALL',
+    'EFFECTIVE_FROM [MM/DD/YY]',
+    'REVISION_TYPE',
+  ].map(norm);
+
+  // Clear ONLY these columns after submit
+  const CLEAR_ONLY_SRC = ['ID.NO', 'REVISION_TYPE', 'PLANNED GROSS', 'EFFECTIVE_FROM [MM/DD/YY]'].map(
+    norm
+  );
+
+  const SRC_EFF = norm('EFFECTIVE_FROM [MM/DD/YY]');
+  const DST_EFF = norm('EFFECTIVE_FROM');
+
+  // Validate required headers exist in source
+  HR_INPUT_SRC.forEach((h) => {
+    if (!srcIdx.has(h)) throw new Error(`HR_UPDATE missing required column: ${h}`);
+  });
+
+  // Validate clear-only headers exist in source (silently skip if any missing)
+  const clearCols = CLEAR_ONLY_SRC.filter((h) => srcIdx.has(h));
+
+  const data = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
+  const eligible = data
+    .map((r, i) => (HR_INPUT_SRC.every((h) => String(r[srcIdx.get(h)] || '').trim() !== '') ? i : null))
+    .filter((i) => i !== null);
+
+  if (!eligible.length) return;
+
+  const now = new Date();
+
+  const outRows = eligible.map((rIdx) => {
+    const r = data[rIdx];
+    const row = new Array(dstLastCol).fill('');
+
+    dstIdx.forEach((dIdx, key) => {
+      if (key === norm('REQUESTED_ON')) row[dIdx] = now;
+      else if (key === DST_EFF && srcIdx.has(SRC_EFF)) row[dIdx] = r[srcIdx.get(SRC_EFF)];
+      else if (srcIdx.has(key)) row[dIdx] = r[srcIdx.get(key)];
+    });
+
+    return row;
+  });
+
+  // Append to REVISION_APPROVAL (kept as-is; if you want "true last row" append here too, tell me)
+  dst.getRange(dst.getLastRow() + 1, 1, outRows.length, dstLastCol).setValues(outRows);
+
+  // Clear only requested columns for submitted rows
+  eligible.forEach((rIdx) => {
+    clearCols.forEach((h) => {
+      src.getRange(rIdx + 2, srcIdx.get(h) + 1).clearContent();
+    });
+  });
+
+  // -------- EMAIL --------
+  const headers = [
+    'REQUESTED_ON',
+    'ID NO',
+    'NAME',
+    'CATEGORY',
+    'DEPARTMENT',
+    'DESIGNATION',
+    'GROSS',
+    'CHANGE OF VALUE',
+    '% OF CHANGE',
+    'EFFECTIVE_FROM',
+    'REVISION_TYPE',
+    'PREV_EFFECTIVE_FROM',
+  ];
+
+  const tz = ss.getSpreadsheetTimeZone();
+
+  const escape = (s) =>
+    String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  const fmt2 = (v, pct) => {
+    const n = parseFloat(String(v).replace(/[% ,]/g, ''));
+    if (isNaN(n)) return v;
+    return pct ? `${n.toFixed(2)}%` : n.toFixed(2);
+  };
+
+  const tableHeader =
+    '<tr>' +
+    headers
+      .map(
+        (h) =>
+          `<th style="border:1px solid #ccc;padding:6px;white-space:normal;word-wrap:break-word;">${h}</th>`
+      )
+      .join('') +
+    '</tr>';
+
+  const tableRows = outRows
+    .map((r) => {
+      return (
+        '<tr>' +
+        headers
+          .map((h) => {
+            const key = h === 'ID NO' ? 'ID.NO' : h;
+            let val = r[dstIdx.get(norm(key))] || '';
+            if (h === 'GROSS' || h === 'CHANGE OF VALUE') val = fmt2(val, false);
+            if (h === '% OF CHANGE') val = fmt2(val, true);
+            if (val instanceof Date) val = Utilities.formatDate(val, tz, 'dd-MMM-yyyy HH:mm');
+            return `<td style="border:1px solid #ccc;padding:6px;">${escape(val)}</td>`;
+          })
+          .join('') +
+        '</tr>'
+      );
+    })
+    .join('');
+
+  const html =
+    `<div style="font-family:Arial;font-size:13px;">` +
+    `<div>${EMAIL_MESSAGE}</div><br>` +
+    `<b>Submitted on ${Utilities.formatDate(new Date(), tz, 'dd-MMM-yyyy HH:mm')}</b><br><br>` +
+    `<table style="border-collapse:collapse;width:100%;">` +
+    tableHeader +
+    tableRows +
+    `</table></div>`;
+
+  const threads = GmailApp.search(`subject:"${EMAIL_SUBJECT}"`, 0, 5);
+  if (threads.length) {
+    threads[0].reply('', { htmlBody: html, replyTo: EMAIL_REPLY_TO });
+  } else {
+    MailApp.sendEmail({
+      to: EMAIL_TO,
+      subject: EMAIL_SUBJECT,
+      htmlBody: html,
+      replyTo: EMAIL_REPLY_TO,
+    });
+  }
+
+  ss.toast('Submitted and email updated successfully.', 'Submit for Approval', 7);
+}
