@@ -80,6 +80,27 @@ function submitForApproval() {
   const clearCols = CLEAR_ONLY_SRC.filter((h) => srcIdx.has(h));
 
   const data = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
+
+  // Stop if duplicate ID.NO exists anywhere in HR_UPDATE (non-blank values only)
+  const idHeader = norm('ID.NO');
+  const idColIdx = srcIdx.get(idHeader);
+  const seenIds = new Set();
+  const duplicateIds = new Set();
+  data.forEach((r) => {
+    const idVal = String(r[idColIdx] || '').trim();
+    if (!idVal) return;
+    if (seenIds.has(idVal)) duplicateIds.add(idVal);
+    else seenIds.add(idVal);
+  });
+  if (duplicateIds.size) {
+    ss.toast(
+      `Stopped: duplicate ID.NO found in "${SRC_SHEET_NAME}" -> ${Array.from(duplicateIds).join(', ')}`,
+      'Submit for Approval',
+      8
+    );
+    return;
+  }
+
   const eligible = data
     .map((r, i) => (HR_INPUT_SRC.every((h) => String(r[srcIdx.get(h)] || '').trim() !== '') ? i : null))
     .filter((i) => i !== null);
