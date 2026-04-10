@@ -3,6 +3,7 @@ function revisionApproval() {
 
   const SRC_SHEET_NAME = 'REVISION_APPROVAL';
   const DST_SHEET_NAME = 'REVISION_HISTORY';
+  const REJECTED_SHEET_NAME = 'REJECTED_HISTORY';
 
   // Must run from REVISION_APPROVAL tab only
   const active = ss.getActiveSheet();
@@ -13,16 +14,19 @@ function revisionApproval() {
 
   const src = ss.getSheetByName(SRC_SHEET_NAME);
   const dst = ss.getSheetByName(DST_SHEET_NAME);
-  if (!src || !dst) throw new Error('Missing required sheet(s). Check exact tab names.');
+  const rejectedDst = ss.getSheetByName(REJECTED_SHEET_NAME);
+  if (!src || !dst || !rejectedDst) throw new Error('Missing required sheet(s). Check exact tab names.');
 
   const srcLastRow = src.getLastRow();
   const srcLastCol = src.getLastColumn();
   if (srcLastRow < 2) return;
 
   const dstLastCol = dst.getLastColumn();
+  const rejectedLastCol = rejectedDst.getLastColumn();
 
   const norm = (h) => String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
   const isApproved = (v) => String(v || '').trim().toUpperCase() === 'APPROVED';
+  const isRejected = (v) => String(v || '').trim().toUpperCase() === 'REJECTED';
 
   // Normalize ID to avoid hidden character issues
   const normId = (v) =>
@@ -35,9 +39,11 @@ function revisionApproval() {
   // Headers
   const srcHeaders = src.getRange(1, 1, 1, srcLastCol).getDisplayValues()[0];
   const dstHeaders = dst.getRange(1, 1, 1, dstLastCol).getDisplayValues()[0];
+  const rejectedHeaders = rejectedDst.getRange(1, 1, 1, rejectedLastCol).getDisplayValues()[0];
 
   const srcIdx = new Map(srcHeaders.map((h, i) => [norm(h), i]));
   const dstIdx = new Map(dstHeaders.map((h, i) => [norm(h), i]));
+  const rejectedIdx = new Map(rejectedHeaders.map((h, i) => [norm(h), i]));
 
   const KEY_ID = norm('ID.NO');
   const KEY_STATUS = norm('APPROVAL_STATUS');
@@ -47,6 +53,9 @@ function revisionApproval() {
   }
   if (!dstIdx.has(KEY_ID)) {
     throw new Error('REVISION_HISTORY must contain ID.NO.');
+  }
+  if (!rejectedIdx.has(KEY_ID) || !rejectedIdx.has(KEY_STATUS)) {
+    throw new Error('REJECTED_HISTORY must contain ID.NO and APPROVAL_STATUS.');
   }
 
   // Destination columns
@@ -62,16 +71,24 @@ function revisionApproval() {
   // Read source data
   const srcData = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
 
-  // Rows to approve
+  // Rows to approve / reject
   const approveIdxs = [];
+  const rejectIdxs = [];
   srcData.forEach((r, i) => {
-    if (isApproved(r[srcIdx.get(KEY_STATUS)]) && String(r[srcIdx.get(KEY_ID)]).trim()) {
+    const idVal = String(r[srcIdx.get(KEY_ID)] || '').trim();
+    const statusVal = r[srcIdx.get(KEY_STATUS)];
+
+    if (!idVal) return;
+
+    if (isApproved(statusVal)) {
       approveIdxs.push(i);
+    } else if (isRejected(statusVal)) {
+      rejectIdxs.push(i);
     }
   });
 
-  if (!approveIdxs.length) {
-    ss.toast('No APPROVED rows found.', 'Revision Approval', 6);
+  if (!approveIdxs.length && !rejectIdxs.length) {
+    ss.toast('No APPROVED / REJECTED rows found.', 'Revision Approval', 6);
     return;
   }
 
@@ -84,15 +101,6 @@ function revisionApproval() {
     norm('REV_ID'),
   ]);
 
-  // --- Robust alias mapping (minimal) ---
-  // If header differs slightly between sheets, map it.
-  const aliasPairs = [
-    // destinationKey, sourceKey
-    [norm('CHANGE OF VALUE'), norm('CHANGE OF VALUE')],
-    [norm('CHANGE OF VALUE'), norm('CHANGE_VALUE')],
-    [norm('CHANGE OF VALUE'), norm('CHANGE')],
-  ];
-
   // Build copy keys: normal exact matches first
   const copyKeys = [];
   dstIdx.forEach((_, k) => {
@@ -100,7 +108,6 @@ function revisionApproval() {
   });
 
   // Ensure CHANGE OF VALUE is copied even if header differs
-  // We'll handle this separately below by looking for dstKey and any matching srcKey alias.
   const dstChangeKey = norm('CHANGE OF VALUE');
   const srcChangeKeyCandidates = [
     norm('CHANGE OF VALUE'),
@@ -154,43 +161,60 @@ function revisionApproval() {
     outRows.push(dRow);
   });
 
-  // ---------- Append at true last data row based on ID.NO ----------
-  const idCol1Based = dstIdx.get(KEY_ID) + 1;
-  const startRow = Math.max(getLastNonEmptyInColumn_(dst, idCol1Based, 2) + 1, 2);
+  // ---------- Append APPROVED rows at true last data row based on ID.NO ----------
+  if (outRows.length) {
+    const idCol1Based = dstIdx.get(KEY_ID) + 1;
+    const startRow = Math.max(getLastNonEmptyInColumn_(dst, idCol1Based, 2) + 1, 2);
 
-  // Read previous IDs only up to pre-append area
-  const prevLastRow = startRow - 1;
-  let prevIds = [];
-  if (prevLastRow >= 2) {
-    prevIds = dst
-      .getRange(2, idCol1Based, prevLastRow - 1, 1)
-      .getDisplayValues()
-      .map((r) => normId(r[0]));
-  }
+    // Read previous IDs only up to pre-append area
+    const prevLastRow = startRow - 1;
+    let prevIds = [];
+    if (prevLastRow >= 2) {
+      prevIds = dst
+        .getRange(2, idCol1Based, prevLastRow - 1, 1)
+        .getDisplayValues()
+        .map((r) => normId(r[0]));
+    }
 
-  // Append rows
-  dst.getRange(startRow, 1, outRows.length, dstLastCol).setValues(outRows);
+    // Append rows
+    dst.getRange(startRow, 1, outRows.length, dstLastCol).setValues(outRows);
 
-  // Deactivate previous rows if found (only among pre-existing rows)
-  if (ACTIVE_COL !== undefined && prevIds.length) {
-    insertedIds.forEach((id) => {
-      for (let idx = prevIds.length - 1; idx >= 0; idx--) {
-        if (prevIds[idx] === id) {
-          const sheetRow = idx + 2; // prevIds[0] => row 2
-          dst.getRange(sheetRow, ACTIVE_COL + 1).setValue('IN-ACTIVE');
-          break;
+    // Deactivate previous rows if found (only among pre-existing rows)
+    if (ACTIVE_COL !== undefined && prevIds.length) {
+      insertedIds.forEach((id) => {
+        for (let idx = prevIds.length - 1; idx >= 0; idx--) {
+          if (prevIds[idx] === id) {
+            const sheetRow = idx + 2; // prevIds[0] => row 2
+            dst.getRange(sheetRow, ACTIVE_COL + 1).setValue('IN-ACTIVE');
+            break;
+          }
         }
-      }
-    });
+      });
+    }
   }
 
-  // Delete approved rows from source (bottom-up)
-  approveIdxs
+  // ---------- Append REJECTED rows to REJECTED_HISTORY at true last data row based on ID.NO ----------
+  if (rejectIdxs.length) {
+    const rejectedOutRows = rejectIdxs.map((i) => srcData[i].slice(0, rejectedLastCol));
+    const rejectedIdCol1Based = rejectedIdx.get(KEY_ID) + 1;
+    const rejectedStartRow = Math.max(getLastNonEmptyInColumn_(rejectedDst, rejectedIdCol1Based, 2) + 1, 2);
+
+    rejectedDst
+      .getRange(rejectedStartRow, 1, rejectedOutRows.length, rejectedLastCol)
+      .setValues(rejectedOutRows);
+  }
+
+  // Delete processed rows from source (bottom-up)
+  [...approveIdxs, ...rejectIdxs]
     .map((i) => i + 2)
     .sort((a, b) => b - a)
     .forEach((r) => src.deleteRow(r));
 
-  ss.toast(`Approved ${outRows.length} revision(s).`, 'Revision Approval', 7);
+  ss.toast(
+    `Approved ${outRows.length} revision(s). Rejected ${rejectIdxs.length} revision(s).`,
+    'Revision Approval',
+    7
+  );
 }
 
 /**
