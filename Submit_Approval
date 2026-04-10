@@ -4,6 +4,8 @@
  * Update:
  * - Clears ONLY: ID.NO, REVISION_TYPE, PLANNED GROSS, EFFECTIVE_FROM [MM/DD/YY]
  * - Email table headers now WRAP TEXT (no nowrap)
+ * - Submit only rows where SUBMIT_STATUS = OK
+ * - Show summary: submitted / skipped
  */
 function submitForApproval() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -70,42 +72,36 @@ function submitForApproval() {
 
   const SRC_EFF = norm('EFFECTIVE_FROM [MM/DD/YY]');
   const DST_EFF = norm('EFFECTIVE_FROM');
+  const SRC_SUBMIT_STATUS = norm('SUBMIT_STATUS');
 
   // Validate required headers exist in source
   HR_INPUT_SRC.forEach((h) => {
     if (!srcIdx.has(h)) throw new Error(`HR_UPDATE missing required column: ${h}`);
   });
 
+  if (!srcIdx.has(SRC_SUBMIT_STATUS)) {
+    throw new Error('HR_UPDATE missing required column: SUBMIT_STATUS');
+  }
+
   // Validate clear-only headers exist in source (silently skip if any missing)
   const clearCols = CLEAR_ONLY_SRC.filter((h) => srcIdx.has(h));
 
   const data = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
 
-  // Stop if duplicate ID.NO exists anywhere in HR_UPDATE (non-blank values only)
-  const idHeader = norm('ID.NO');
-  const idColIdx = srcIdx.get(idHeader);
-  const seenIds = new Set();
-  const duplicateIds = new Set();
-  data.forEach((r) => {
-    const idVal = String(r[idColIdx] || '').trim();
-    if (!idVal) return;
-    if (seenIds.has(idVal)) duplicateIds.add(idVal);
-    else seenIds.add(idVal);
-  });
-  if (duplicateIds.size) {
-    ss.toast(
-      `Stopped: duplicate ID.NO found in "${SRC_SHEET_NAME}" -> ${Array.from(duplicateIds).join(', ')}`,
-      'Submit for Approval',
-      8
-    );
-    return;
-  }
-
   const eligible = data
-    .map((r, i) => (HR_INPUT_SRC.every((h) => String(r[srcIdx.get(h)] || '').trim() !== '') ? i : null))
+    .map((r, i) => {
+      const requiredFilled = HR_INPUT_SRC.every((h) => String(r[srcIdx.get(h)] || '').trim() !== '');
+      const submitStatus = String(r[srcIdx.get(SRC_SUBMIT_STATUS)] || '').trim().toUpperCase();
+      return requiredFilled && submitStatus === 'OK' ? i : null;
+    })
     .filter((i) => i !== null);
 
-  if (!eligible.length) return;
+  const skippedCount = data.length - eligible.length;
+
+  if (!eligible.length) {
+    ss.toast(`Submitted: 0 | Skipped: ${skippedCount}`, 'Submit for Approval', 7);
+    return;
+  }
 
   const now = new Date();
 
@@ -122,7 +118,7 @@ function submitForApproval() {
     return row;
   });
 
-  // Append to REVISION_APPROVAL (kept as-is; if you want "true last row" append here too, tell me)
+  // Append to REVISION_APPROVAL
   dst.getRange(dst.getLastRow() + 1, 1, outRows.length, dstLastCol).setValues(outRows);
 
   // Clear only requested columns for submitted rows
@@ -212,5 +208,5 @@ function submitForApproval() {
     });
   }
 
-  ss.toast('Submitted and email updated successfully.', 'Submit for Approval', 7);
+  ss.toast(`Submitted: ${eligible.length} | Skipped: ${skippedCount}`, 'Submit for Approval', 7);
 }
