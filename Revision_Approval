@@ -65,8 +65,7 @@ function revisionApproval() {
 
   const APPROVED_BY_COL = dstIdx.get(norm('APPROVED_BY'));
   const APPROVED_ON_COL = dstIdx.get(norm('APPROVED_ON'));
-  // REV_ID is formula-driven (do not write)
-  // const REV_ID_COL = dstIdx.get(norm('REV_ID'));
+  const REV_ID_COL = dstIdx.get(norm('REV_ID')); // formula-driven (must not be written)
 
   // Read source data
   const srcData = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
@@ -176,8 +175,16 @@ function revisionApproval() {
         .map((r) => normId(r[0]));
     }
 
-    // Append rows
-    dst.getRange(startRow, 1, outRows.length, dstLastCol).setValues(outRows);
+    // Insert rows first so formula columns (like REV_ID) auto-fill from sheet formulas
+    dst.insertRowsBefore(startRow, outRows.length);
+
+    // Write only non-formula columns; never touch REV_ID column
+    for (let c = 0; c < dstLastCol; c++) {
+      if (c === REV_ID_COL) continue;
+
+      const colValues = outRows.map((row) => [row[c]]);
+      dst.getRange(startRow, c + 1, outRows.length, 1).setValues(colValues);
+    }
 
     // Deactivate previous rows if found (only among pre-existing rows)
     if (ACTIVE_COL !== undefined && prevIds.length) {
